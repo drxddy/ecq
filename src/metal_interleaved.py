@@ -244,6 +244,131 @@ kernel void fused_parallel_gemv(
 }
 
 // ============================================================================
+// Kernel 2b: Fused GEMV with THREADGROUP-CACHED sym_table (ASTC-inspired)
+// 
+// Key optimization: Cache the entire 16KB sym_table in threadgroup memory
+// This mimics ASTC's approach of using fast on-chip memory for lookups
+// 
+// Tradeoff: Uses 16KB of threadgroup memory (Apple Silicon has 32KB max)
+// ============================================================================
+kernel void fused_parallel_gemv_cached(
+    device const uint8_t* compressed [[buffer(0)]],
+    device const uint* stream_lengths [[buffer(1)]],
+    device const uint16_t* freq_global [[buffer(2)]],
+    device const uint16_t* cumfreq_global [[buffer(3)]],
+    device const uint8_t* sym_table_global [[buffer(4)]],
+    device const float* input [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    constant float& scale [[buffer(7)]],
+    constant float& zero_point [[buffer(8)]],
+    constant uint& n_streams [[buffer(9)]],
+    constant uint& n_symbols [[buffer(10)]],
+    constant uint& max_stream_len [[buffer(11)]],
+    uint tid [[thread_position_in_grid]],
+    uint tgsize [[threads_per_threadgroup]],
+    uint local_tid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    // =========================================================================
+    // OPTIMIZATION 3: Cache ENTIRE sym_table in threadgroup memory
+    // This is the ASTC-inspired optimization: use fast on-chip memory
+    // 
+    // sym_table is 16KB (16384 bytes for PROB_SCALE=16384)
+    // Apple Silicon has 32KB threadgroup memory - this fits!
+    // =========================================================================
+    threadgroup uint8_t shared_sym_table[PROB_SCALE];  // 16KB
+    threadgroup float partial_sums[32];
+    
+    // Cooperative load of sym_table (all threads participate)
+    // Each thread loads PROB_SCALE/tgsize entries
+    uint entries_per_thread = (PROB_SCALE + tgsize - 1) / tgsize;
+    for (uint i = 0; i < entries_per_thread; i++) {
+        uint idx = local_tid + i * tgsize;
+        if (idx < PROB_SCALE) {
+            shared_sym_table[idx] = sym_table_global[idx];
+        }
+    }
+    
+    // Cache frequency tables in registers (32 bytes - tiny)
+    uint16_t local_freq[16];
+    uint16_t local_cumfreq[16];
+    for (int i = 0; i < 16; i++) {
+        local_freq[i] = freq_global[i];
+        local_cumfreq[i] = cumfreq_global[i];
+    }
+    
+    // Barrier: ensure sym_table is fully loaded
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Now decode with ZERO VRAM access for sym_table!
+    uint stream_idx = tid;
+    float acc = 0.0f;
+    
+    if (stream_idx < n_streams) {
+        uint stream_len = stream_lengths[stream_idx];
+        
+        if (stream_len >= 4) {
+            // Coalesced state initialization
+            uint b0 = compressed[stream_idx + 0 * n_streams];
+            uint b1 = compressed[stream_idx + 1 * n_streams];
+            uint b2 = compressed[stream_idx + 2 * n_streams];
+            uint b3 = compressed[stream_idx + 3 * n_streams];
+            uint state = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+            uint ptr = 4;
+            
+            uint symbols_in_stream = (n_symbols - stream_idx + n_streams - 1) / n_streams;
+            
+            for (uint i = 0; i < symbols_in_stream; i++) {
+                uint output_idx = stream_idx + i * n_streams;
+                if (output_idx >= n_symbols) break;
+                
+                // Decode step - FAST: threadgroup memory access (~2 cycles vs ~300)
+                uint slot = state & (PROB_SCALE - 1);
+                uint8_t s = shared_sym_table[slot];  // << THREADGROUP MEMORY!
+                
+                // Register-cached tables
+                uint freq_s = local_freq[s];
+                uint start_s = local_cumfreq[s];
+                state = freq_s * (state >> PROB_BITS) + slot - start_s;
+                
+                // Coalesced renormalization
+                while (state < RANS_L && ptr < stream_len) {
+                    uint8_t b = compressed[stream_idx + ptr * n_streams];
+                    state = (state << 8) | b;
+                    ptr++;
+                }
+                
+                // Dequantize + MAC
+                float weight = float(s) * scale + zero_point;
+                acc += weight * input[output_idx];
+            }
+        }
+    }
+    
+    // SIMD reduction
+    acc = simd_sum(acc);
+    if (simd_lane == 0) {
+        partial_sums[simd_group] = acc;
+    }
+    
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    if (simd_group == 0) {
+        float final_sum = 0.0f;
+        uint n_groups = (min(tgsize, n_streams) + 31) / 32;
+        if (simd_lane < n_groups) {
+            final_sum = partial_sums[simd_lane];
+        }
+        final_sum = simd_sum(final_sum);
+        
+        if (tid == 0) {
+            output[0] = final_sum;
+        }
+    }
+}
+
+// ============================================================================
 // Kernel 3: Tiled GEMM with parallel decode per row
 // Each threadgroup handles one output row
 // ============================================================================
@@ -669,6 +794,7 @@ class MetalInterleavedRANS:
         # Get kernel functions
         self.decode_fn = library.newFunctionWithName_("parallel_rans_decode")
         self.gemv_fn = library.newFunctionWithName_("fused_parallel_gemv")
+        self.gemv_cached_fn = library.newFunctionWithName_("fused_parallel_gemv_cached")
         self.bench_fn = library.newFunctionWithName_("parallel_decode_bench")
         self.row_bench_fn = library.newFunctionWithName_("row_parallel_decode_bench")
         self.fused_mem_fn = library.newFunctionWithName_("fused_memory_bench")
@@ -679,6 +805,9 @@ class MetalInterleavedRANS:
         )
         self.gemv_pipeline, _ = self.device.newComputePipelineStateWithFunction_error_(
             self.gemv_fn, None
+        )
+        self.gemv_cached_pipeline, _ = self.device.newComputePipelineStateWithFunction_error_(
+            self.gemv_cached_fn, None
         )
         self.bench_pipeline, _ = self.device.newComputePipelineStateWithFunction_error_(
             self.bench_fn, None
@@ -1001,6 +1130,132 @@ class MetalInterleavedRANS:
             'symbols_per_sec': symbols_per_sec,
             'gsymbols_per_sec': symbols_per_sec / 1e9,
         }
+    
+    def benchmark_gemv_comparison(
+        self,
+        n_symbols: int = 1_000_000,
+        n_streams: int = 256,
+        n_iterations: int = 50
+    ) -> dict:
+        """Compare original vs cached GEMV kernel.
+        
+        This measures the impact of caching sym_table in threadgroup memory.
+        """
+        # Create test data
+        np.random.seed(42)
+        
+        # Simulate compressed data (physically interleaved)
+        max_stream_len = (n_symbols // n_streams) * 2 + 4  # Rough estimate
+        compressed = np.random.randint(0, 256, n_streams * max_stream_len, dtype=np.uint8)
+        stream_lengths = np.full(n_streams, max_stream_len, dtype=np.uint32)
+        
+        # Create frequency tables (typical distribution)
+        freq = np.array([100, 500, 1500, 3000, 4000, 3000, 2000, 1000, 
+                         500, 300, 100, 50, 30, 10, 5, 1], dtype=np.uint16)
+        freq = (freq * (16384 // freq.sum())).astype(np.uint16)
+        freq[-1] = 16384 - freq[:-1].sum()  # Ensure sums to PROB_SCALE
+        
+        cumfreq = np.zeros(17, dtype=np.uint16)
+        cumfreq[1:] = np.cumsum(freq)
+        
+        # Build sym_table
+        sym_table = np.zeros(16384, dtype=np.uint8)
+        for s in range(16):
+            sym_table[cumfreq[s]:cumfreq[s+1]] = s
+        
+        # Input vector and output
+        input_vec = np.random.randn(n_symbols).astype(np.float32)
+        output = np.zeros(1, dtype=np.float32)
+        
+        # Create buffers
+        compressed_buf = self._make_buffer(compressed)
+        stream_lengths_buf = self._make_buffer(stream_lengths)
+        freq_buf = self._make_buffer(freq)
+        cumfreq_buf = self._make_buffer(cumfreq)
+        sym_table_buf = self._make_buffer(sym_table)
+        input_buf = self._make_buffer(input_vec)
+        output_buf = self._make_buffer(output)
+        
+        scale = np.float32(0.1)
+        zp = np.float32(-0.05)
+        scale_buf = self._make_buffer(np.array([scale], dtype=np.float32))
+        zp_buf = self._make_buffer(np.array([zp], dtype=np.float32))
+        n_streams_buf = self._make_buffer(np.array([n_streams], dtype=np.uint32))
+        n_symbols_buf = self._make_buffer(np.array([n_symbols], dtype=np.uint32))
+        max_stream_len_buf = self._make_buffer(np.array([max_stream_len], dtype=np.uint32))
+        
+        results = {}
+        
+        for name, pipeline in [("original", self.gemv_pipeline), 
+                                ("cached", self.gemv_cached_pipeline)]:
+            # Warmup
+            for _ in range(5):
+                cmd = self.queue.commandBuffer()
+                enc = cmd.computeCommandEncoder()
+                enc.setComputePipelineState_(pipeline)
+                enc.setBuffer_offset_atIndex_(compressed_buf, 0, 0)
+                enc.setBuffer_offset_atIndex_(stream_lengths_buf, 0, 1)
+                enc.setBuffer_offset_atIndex_(freq_buf, 0, 2)
+                enc.setBuffer_offset_atIndex_(cumfreq_buf, 0, 3)
+                enc.setBuffer_offset_atIndex_(sym_table_buf, 0, 4)
+                enc.setBuffer_offset_atIndex_(input_buf, 0, 5)
+                enc.setBuffer_offset_atIndex_(output_buf, 0, 6)
+                enc.setBuffer_offset_atIndex_(scale_buf, 0, 7)
+                enc.setBuffer_offset_atIndex_(zp_buf, 0, 8)
+                enc.setBuffer_offset_atIndex_(n_streams_buf, 0, 9)
+                enc.setBuffer_offset_atIndex_(n_symbols_buf, 0, 10)
+                enc.setBuffer_offset_atIndex_(max_stream_len_buf, 0, 11)
+                enc.dispatchThreads_threadsPerThreadgroup_(
+                    Metal.MTLSizeMake(n_streams, 1, 1),
+                    Metal.MTLSizeMake(min(n_streams, 256), 1, 1)
+                )
+                enc.endEncoding()
+                cmd.commit()
+                cmd.waitUntilCompleted()
+            
+            # Benchmark
+            times = []
+            for _ in range(n_iterations):
+                cmd = self.queue.commandBuffer()
+                enc = cmd.computeCommandEncoder()
+                enc.setComputePipelineState_(pipeline)
+                enc.setBuffer_offset_atIndex_(compressed_buf, 0, 0)
+                enc.setBuffer_offset_atIndex_(stream_lengths_buf, 0, 1)
+                enc.setBuffer_offset_atIndex_(freq_buf, 0, 2)
+                enc.setBuffer_offset_atIndex_(cumfreq_buf, 0, 3)
+                enc.setBuffer_offset_atIndex_(sym_table_buf, 0, 4)
+                enc.setBuffer_offset_atIndex_(input_buf, 0, 5)
+                enc.setBuffer_offset_atIndex_(output_buf, 0, 6)
+                enc.setBuffer_offset_atIndex_(scale_buf, 0, 7)
+                enc.setBuffer_offset_atIndex_(zp_buf, 0, 8)
+                enc.setBuffer_offset_atIndex_(n_streams_buf, 0, 9)
+                enc.setBuffer_offset_atIndex_(n_symbols_buf, 0, 10)
+                enc.setBuffer_offset_atIndex_(max_stream_len_buf, 0, 11)
+                enc.dispatchThreads_threadsPerThreadgroup_(
+                    Metal.MTLSizeMake(n_streams, 1, 1),
+                    Metal.MTLSizeMake(min(n_streams, 256), 1, 1)
+                )
+                enc.endEncoding()
+                
+                start = time.perf_counter()
+                cmd.commit()
+                cmd.waitUntilCompleted()
+                times.append(time.perf_counter() - start)
+            
+            avg_time = np.mean(times)
+            symbols_per_sec = n_symbols / avg_time
+            
+            results[name] = {
+                'avg_time_ms': avg_time * 1000,
+                'symbols_per_sec': symbols_per_sec,
+                'gsymbols_per_sec': symbols_per_sec / 1e9,
+            }
+        
+        # Compute improvement
+        improvement = results['original']['avg_time_ms'] / results['cached']['avg_time_ms']
+        results['improvement'] = improvement
+        
+        return results
 
 
 def test_metal_interleaved():
