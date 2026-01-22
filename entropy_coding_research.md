@@ -256,8 +256,12 @@ Ran on Apple M2 Pro (16 GPU cores, 200 GB/s bandwidth):
 | [experiments/validate_compression.py](experiments/validate_compression.py) | Main validation script |
 | [src/quantizer.py](src/quantizer.py) | Quantization utilities |
 | [src/rans.py](src/rans.py) | rANS encoder/decoder |
+| [src/interleaved_rans.py](src/interleaved_rans.py) | Interleaved rANS for GPU parallelism |
+| [src/metal_interleaved.py](src/metal_interleaved.py) | Metal GPU implementation |
 | [src/model_analyzer.py](src/model_analyzer.py) | Model analysis tools |
 | [docs/metal_kernel_design.md](docs/metal_kernel_design.md) | Metal kernel architecture |
+| [docs/mlx_integration_plan.md](docs/mlx_integration_plan.md) | MLX framework integration plan |
+| [docs/mlx_github_issue_draft.md](docs/mlx_github_issue_draft.md) | GitHub issue draft for MLX repo |
 
 ---
 
