@@ -25,13 +25,28 @@ from .rans import PROB_BITS, PROB_SCALE, RANS_BYTE_L, RANSTable
 
 @dataclass
 class InterleavedEncodedTile:
-    """Compressed tile with interleaved streams."""
-    data: bytes           # Concatenated stream data
-    stream_offsets: List[int]  # Offset of each stream in data
+    """Compressed tile with physically interleaved streams.
+    
+    Data layout (CRITICAL for GPU coalescing):
+    - Old (logical): [Stream0 bytes...][Stream1 bytes...][Stream2 bytes...]
+    - New (physical): [S0_B0, S1_B0, S2_B0, S3_B0, S0_B1, S1_B1, S2_B1, S3_B1, ...]
+    
+    This ensures adjacent GPU threads read adjacent memory addresses.
+    """
+    data: bytes           # Physically interleaved stream data
+    stream_lengths: List[int]  # Length of each stream (for decode bounds)
+    max_stream_len: int   # Padded length (all streams same size for interleaving)
     n_symbols: int
     n_streams: int
     table: RANSTable
     original_bytes: int
+    
+    @property
+    def stream_offsets(self) -> List[int]:
+        """Compatibility: compute logical offsets from physical layout."""
+        # In physical layout, each stream is at stride n_streams
+        # stream_offsets[i] = i (byte offset within each interleaved chunk)
+        return list(range(self.n_streams))
     
     @property
     def compressed_bytes(self) -> int:
@@ -47,28 +62,24 @@ class InterleavedEncodedTile:
     
     def to_bytes(self) -> bytes:
         """Serialize for Metal kernel."""
-        # Header: n_streams (1B), n_symbols (4B), stream_lengths (n_streams * 4B)
-        stream_lengths = []
-        for i in range(self.n_streams):
-            if i + 1 < len(self.stream_offsets):
-                stream_lengths.append(self.stream_offsets[i + 1] - self.stream_offsets[i])
-            else:
-                stream_lengths.append(len(self.data) - self.stream_offsets[i])
-        
+        # Header: n_streams (1B), n_symbols (4B), max_stream_len (4B), stream_lengths (n_streams * 4B)
         header = struct.pack(
-            f'<BI{self.n_streams}I',
+            f'<BII{self.n_streams}I',
             self.n_streams,
             self.n_symbols,
-            *stream_lengths
+            self.max_stream_len,
+            *self.stream_lengths
         )
         return header + self.table.to_bytes() + self.data
 
 
 def interleaved_rans_encode(symbols: np.ndarray, table: RANSTable, n_streams: int = 4) -> InterleavedEncodedTile:
     """
-    Encode symbols using interleaved rANS streams.
+    Encode symbols using interleaved rANS streams with PHYSICAL interleaving.
     
     Each stream encodes every n_streams-th symbol.
+    Output data is physically interleaved for GPU memory coalescing:
+    [S0_B0, S1_B0, S2_B0, S3_B0, S0_B1, S1_B1, ...]
     """
     symbols = symbols.flatten().astype(np.uint32)
     n = len(symbols)
@@ -76,17 +87,15 @@ def interleaved_rans_encode(symbols: np.ndarray, table: RANSTable, n_streams: in
     # Split symbols into interleaved streams
     stream_symbols = [symbols[i::n_streams] for i in range(n_streams)]
     
-    # Encode each stream independently
-    stream_data = []
-    stream_offsets = []
+    # Encode each stream independently (get raw bytes per stream)
+    stream_bytes_list = []
+    stream_lengths = []
     
-    current_offset = 0
     for stream_idx in range(n_streams):
-        stream_offsets.append(current_offset)
-        
         syms = stream_symbols[stream_idx]
         if len(syms) == 0:
-            stream_data.append(b'')
+            stream_bytes_list.append(b'')
+            stream_lengths.append(0)
             continue
         
         # Encode this stream
@@ -116,15 +125,27 @@ def interleaved_rans_encode(symbols: np.ndarray, table: RANSTable, n_streams: in
         
         # Reverse for decoding order
         encoded = bytes(reversed(out_bytes))
-        stream_data.append(encoded)
-        current_offset += len(encoded)
+        stream_bytes_list.append(encoded)
+        stream_lengths.append(len(encoded))
     
-    # Concatenate all streams
-    all_data = b''.join(stream_data)
+    # PHYSICAL INTERLEAVING (Critical for GPU coalescing)
+    # Pad all streams to same length, then interleave byte-by-byte
+    max_stream_len = max(stream_lengths) if stream_lengths else 0
+    
+    # Create padded numpy array for efficient interleaving
+    stream_matrix = np.zeros((n_streams, max_stream_len), dtype=np.uint8)
+    for i, stream_data in enumerate(stream_bytes_list):
+        if len(stream_data) > 0:
+            stream_matrix[i, :len(stream_data)] = np.frombuffer(stream_data, dtype=np.uint8)
+    
+    # Transpose and flatten: (n_streams, max_len) -> (max_len, n_streams) -> flat
+    # Result: [S0_B0, S1_B0, S2_B0, S3_B0, S0_B1, S1_B1, S2_B1, S3_B1, ...]
+    interleaved_data = stream_matrix.T.flatten().tobytes()
     
     return InterleavedEncodedTile(
-        data=all_data,
-        stream_offsets=stream_offsets,
+        data=interleaved_data,
+        stream_lengths=stream_lengths,
+        max_stream_len=max_stream_len,
         n_symbols=n,
         n_streams=n_streams,
         table=table,
@@ -134,39 +155,38 @@ def interleaved_rans_encode(symbols: np.ndarray, table: RANSTable, n_streams: in
 
 def interleaved_rans_decode(tile: InterleavedEncodedTile) -> np.ndarray:
     """
-    Decode interleaved rANS streams.
+    Decode physically interleaved rANS streams.
+    
+    Data layout: [S0_B0, S1_B0, S2_B0, S3_B0, S0_B1, S1_B1, ...]
+    Access pattern: data[stream_idx + ptr * n_streams]
     
     This Python version is sequential for verification.
-    The Metal version processes all streams in parallel.
+    The Metal version processes all streams in parallel with coalesced reads.
     """
-    data = tile.data
+    data = np.frombuffer(tile.data, dtype=np.uint8)
     n_streams = tile.n_streams
     n_symbols = tile.n_symbols
+    max_stream_len = tile.max_stream_len
+    stream_lengths = tile.stream_lengths
     table = tile.table
-    
-    # Calculate symbols per stream
-    symbols_per_stream = (n_symbols + n_streams - 1) // n_streams
     
     # Decode each stream
     output = np.zeros(n_symbols, dtype=np.uint8)
     
     for stream_idx in range(n_streams):
-        # Get stream data slice
-        start = tile.stream_offsets[stream_idx]
-        if stream_idx + 1 < n_streams:
-            end = tile.stream_offsets[stream_idx + 1]
-        else:
-            end = len(data)
-        
-        stream_data = list(data[start:end])
-        if len(stream_data) < 4:
+        stream_len = stream_lengths[stream_idx]
+        if stream_len < 4:
             continue
         
-        # Initialize state (4 bytes, big-endian)
+        # COALESCED READ PATTERN: data[stream_idx + ptr * n_streams]
+        def read_byte(ptr: int) -> int:
+            return int(data[stream_idx + ptr * n_streams])
+        
+        # Initialize state (4 bytes, big-endian) - coalesced reads
         ptr = 0
-        state = (stream_data[ptr] << 24) | (stream_data[ptr+1] << 16) | \
-                (stream_data[ptr+2] << 8) | stream_data[ptr+3]
-        ptr += 4
+        state = (read_byte(0) << 24) | (read_byte(1) << 16) | \
+                (read_byte(2) << 8) | read_byte(3)
+        ptr = 4
         
         # Number of symbols in this stream
         n_syms = len(range(stream_idx, n_symbols, n_streams))
@@ -189,9 +209,9 @@ def interleaved_rans_decode(tile: InterleavedEncodedTile) -> np.ndarray:
             start_s = int(table.cumfreq[s])
             state = freq_s * (state >> PROB_BITS) + slot - start_s
             
-            # Renormalize
-            while state < RANS_BYTE_L and ptr < len(stream_data):
-                state = (state << 8) | stream_data[ptr]
+            # Renormalize (coalesced reads)
+            while state < RANS_BYTE_L and ptr < stream_len:
+                state = (state << 8) | read_byte(ptr)
                 ptr += 1
     
     return output
